@@ -15,6 +15,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&display=swap" rel="stylesheet">
 <link href="https://cdn.jsdelivr.net/npm/cesium@1.146.0/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/cesium@1.146.0/Build/Cesium/Cesium.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@photostructure/tz-lookup@11.7.0/tz.js"></script>
 <style>
   :root {
     --ink: #18222f;
@@ -105,6 +106,13 @@
 
   .readout { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
   #clock { white-space: nowrap; font-family: var(--display); font-weight: 700; font-size: 38px; letter-spacing: -0.02em; line-height: 1; font-variant-numeric: tabular-nums; }
+  #tzLbl { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  #tzLbl:empty { display: none; }
+  .setRow { display: flex; align-items: center; gap: 10px; }
+  .setRow input[type=range] { flex: 1; accent-color: var(--sun); height: 32px; }
+  .setRow output { min-width: 64px; text-align: right; font-variant-numeric: tabular-nums; font-weight: 700; }
+  .hint { color: var(--muted); font-size: 13px; line-height: 1.4; margin: 4px 0 0; }
+  .card .seg { display: inline-flex; }
   #sunText { color: var(--muted); font-size: 14px; text-align: right; line-height: 1.3; }
   #sunText b { color: var(--sun); font-weight: 700; }
 
@@ -251,7 +259,7 @@
 
 <div id="panel">
   <div class="readout">
-    <div id="clock">--:--</div>
+    <div><div id="clock">--:--</div><div id="tzLbl"></div></div>
     <div id="sunText">Search an address to start</div>
   </div>
   <div class="sliderRow">
@@ -274,14 +282,30 @@
 
 <div class="dialog" id="setup">
   <div class="card">
-    <h2>Connect your map data</h2>
+    <h2 id="setupTitle">Connect your map data</h2>
+    <div id="tokenIntro">
     <p>This app streams terrain, 3D buildings and imagery from Cesium ion. Paste your free Cesium ion access token below. It's saved only on this device.</p>
     <p>Don't have one? Sign up at <a href="https://ion.cesium.com/signup" target="_blank" rel="noopener">ion.cesium.com</a>, then open Access Tokens.</p>
+    </div>
     <label for="tokenIn">Cesium ion access token</label>
     <input type="text" id="tokenIn" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="eyJhbGciOi…">
     <div class="cardBtns">
       <button class="btn primary" id="tokenSave">Save and start</button>
       <button class="btn" id="setupClose">Close</button>
+    </div>
+    <div id="displaySettings">
+      <label for="distIn" style="margin-top:22px">Shadow draw distance</label>
+      <div class="setRow">
+        <input type="range" id="distIn" min="100" max="1000" step="50">
+        <output id="distOut"></output>
+      </div>
+      <p class="hint">Shorter gives sharper shadows. Longer shows shadows from buildings farther away.</p>
+      <label>3D mesh detail</label>
+      <div class="seg" role="group" aria-label="3D mesh detail">
+        <button id="detNormal" aria-pressed="true">Normal</button>
+        <button id="detHigh" aria-pressed="false">High</button>
+      </div>
+      <p class="hint">High loads sharper nearby detail but uses more data and memory.</p>
     </div>
     <label style="margin-top:22px">Saved changes</label>
     <p>Building heights and trees you add are stored on this device.</p>
@@ -330,9 +354,38 @@ const ION_TOKEN = "";
     const az = Math.atan2(Math.sin(H), Math.cos(H) * Math.sin(phi) - Math.tan(dec) * Math.cos(phi));
     return { alt: alt / RAD, az: ((az / RAD) + 180 + 360) % 360 };
   }
+  // ---------- Time zone of the house (not the device) ----------
+  const DEVICE_TZ = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  let TZ = DEVICE_TZ;
+  const fmtCache = {};
+  function tzParts(date, tz = TZ) {
+    const f = fmtCache[tz] || (fmtCache[tz] = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz, hourCycle: "h23", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
+    }));
+    const o = {};
+    for (const part of f.formatToParts(date)) o[part.type] = part.value;
+    return o;
+  }
+  function tzOffsetMs(date, tz = TZ) {
+    const o = tzParts(date, tz);
+    const asUtc = Date.UTC(+o.year, +o.month - 1, +o.day, +o.hour % 24, +o.minute, +o.second);
+    return asUtc - Math.floor(date.getTime() / 1000) * 1000;
+  }
+  function tzForPlace(lat, lon) {
+    try { return typeof tzlookup === "function" ? tzlookup(lat, lon) : DEVICE_TZ; } catch { return DEVICE_TZ; }
+  }
+  // Midnight at the house, as a real instant.
   function dayStart(dayStr) {
     const [y, m, d] = dayStr.split("-").map(Number);
-    return new Date(y, m - 1, d, 0, 0, 0, 0);
+    const guess = Date.UTC(y, m - 1, d);
+    let t = guess - tzOffsetMs(new Date(guess));
+    t = guess - tzOffsetMs(new Date(t));
+    return new Date(t);
+  }
+  function addDays(dayStr, n) {
+    const [y, m, d] = dayStr.split("-").map(Number);
+    const x = new Date(Date.UTC(y, m - 1, d + n));
+    return x.toISOString().slice(0, 10);
   }
   function dayTimes(dayStr, lat, lon) {
     const base = dayStart(dayStr).getTime();
@@ -349,10 +402,18 @@ const ION_TOKEN = "";
   }
   const DIRS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
   const dirName = (az) => DIRS[Math.round(az / 45) % 8];
-  const fmtTime = (date) => date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const fmtTime = (date) => date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", timeZone: TZ });
   function isoDay(date) {
-    const p = (n) => String(n).padStart(2, "0");
-    return `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())}`;
+    const o = tzParts(date);
+    return `${o.year}-${o.month}-${o.day}`;
+  }
+  function nowMinutes() {
+    const o = tzParts(new Date());
+    return Math.round(((+o.hour % 24) * 60 + +o.minute) / 5) * 5;
+  }
+  function setTz(tz) {
+    TZ = tz;
+    $("tzLbl").textContent = tz !== DEVICE_TZ ? tz.split("/").pop().replace(/_/g, " ") + " time" : "";
   }
 
   // ---------- State ----------
@@ -393,6 +454,10 @@ const ION_TOKEN = "";
   // ---------- Setup / token ----------
   const token = ION_TOKEN || store.get("shade.token", "");
   $("settingsBtn").onclick = () => { $("tokenIn").value = token; $("setup").classList.add("open"); };
+  $("setupTitle").textContent = token ? "Settings" : "Connect your map data";
+  $("tokenSave").textContent = token ? "Save token and reload" : "Save and start";
+  $("displaySettings").style.display = token ? "" : "none";
+  $("tokenIntro").style.display = token ? "none" : "";
   $("setupClose").onclick = () => $("setup").classList.remove("open");
   $("tokenSave").onclick = () => {
     const v = $("tokenIn").value.trim();
@@ -449,6 +514,36 @@ const ION_TOKEN = "";
   sm.darkness = 0.55;
   sm.maximumDistance = 350;
   sm.fadingEnabled = false;
+
+  // Settings saved on this device.
+  const prefs = Object.assign({ dist: 350, detail: "normal" }, store.get("shade.prefs", {}));
+  const DETAIL = {
+    normal: { sse: 8, cache: 256 },
+    high: { sse: 3, cache: 640 },
+  };
+  function applyPrefs() {
+    sm.maximumDistance = prefs.dist;
+    // Extra depth bias removes the striped "shadow acne" pattern; scaled because
+    // a longer draw distance stretches each shadow-map pixel over more ground.
+    const k = Math.max(1, prefs.dist / 350);
+    Object.assign(sm._primitiveBias, { depthBias: 0.0002 * k, polygonOffsetFactor: 2, polygonOffsetUnits: 8, normalOffsetScale: 0.2 });
+    Object.assign(sm._terrainBias, { depthBias: 0.0004 * k, polygonOffsetFactor: 2, polygonOffsetUnits: 8 });
+    sm.dirty = true;
+    if (mesh) {
+      const d = DETAIL[prefs.detail] || DETAIL.normal;
+      mesh.maximumScreenSpaceError = d.sse;
+      mesh.cacheBytes = d.cache * 1024 * 1024;
+    }
+    $("distIn").value = prefs.dist;
+    $("distOut").textContent = prefs.dist + " m";
+    $("detNormal").setAttribute("aria-pressed", prefs.detail !== "high");
+    $("detHigh").setAttribute("aria-pressed", prefs.detail === "high");
+    store.set("shade.prefs", prefs);
+    scene.requestRender();
+  }
+  $("distIn").oninput = (e) => { prefs.dist = parseInt(e.target.value, 10); applyPrefs(); };
+  $("detNormal").onclick = () => { prefs.detail = "normal"; applyPrefs(); };
+  $("detHigh").onclick = () => { prefs.detail = "high"; applyPrefs(); };
 
   const ctrl = scene.screenSpaceCameraController;
 
@@ -884,14 +979,15 @@ const ION_TOKEN = "";
   function buildDays() {
     const box = $("days");
     box.innerHTML = "";
-    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const today = isoDay(new Date());
+    const noon = (iso) => new Date(dayStart(iso).getTime() + 12 * 36e5);
     const list = [];
     for (let i = 0; i < 7; i++) {
-      const d = new Date(today); d.setDate(today.getDate() + i);
-      list.push({ iso: isoDay(d), label: i === 0 ? "Today" : i === 1 ? "Tomorrow" : d.toLocaleDateString([], { weekday: "short", day: "numeric" }) });
+      const iso = addDays(today, i);
+      list.push({ iso, label: i === 0 ? "Today" : i === 1 ? "Tomorrow" : noon(iso).toLocaleDateString([], { weekday: "short", day: "numeric", timeZone: TZ }) });
     }
     if (!list.some((x) => x.iso === state.day)) {
-      list.unshift({ iso: state.day, label: dayStart(state.day).toLocaleDateString([], { month: "short", day: "numeric" }) });
+      list.unshift({ iso: state.day, label: noon(state.day).toLocaleDateString([], { month: "short", day: "numeric", timeZone: TZ }) });
     }
     for (const x of list) {
       const b = document.createElement("button");
@@ -924,8 +1020,21 @@ const ION_TOKEN = "";
     if (!meshLoading) {
       meshLoading = Cesium.createGooglePhotorealistic3DTileset(
         { onlyUsingWithGoogleGeocoder: true },
-        { cacheBytes: 256 * 1024 * 1024, maximumCacheOverflowBytes: 128 * 1024 * 1024, maximumScreenSpaceError: 12, shadows: Cesium.ShadowMode.ENABLED }
-      ).then((ts) => { mesh = ts; scene.primitives.add(ts); return ts; });
+        {
+          cacheBytes: (DETAIL[prefs.detail] || DETAIL.normal).cache * 1024 * 1024,
+          maximumCacheOverflowBytes: 128 * 1024 * 1024,
+          maximumScreenSpaceError: (DETAIL[prefs.detail] || DETAIL.normal).sse,
+          // Deferred edge tiles never finish loading when the scene only redraws on demand.
+          foveatedScreenSpaceError: false,
+          shadows: Cesium.ShadowMode.ENABLED,
+        }
+      ).then((ts) => {
+        mesh = ts;
+        scene.primitives.add(ts);
+        ts.tileLoad.addEventListener(() => scene.requestRender());
+        ts.allTilesLoaded.addEventListener(() => scene.requestRender());
+        return ts;
+      });
     }
     return meshLoading;
   }
@@ -1022,7 +1131,7 @@ const ION_TOKEN = "";
 
   // ---------- Home ----------
   let pin = null;
-  async function setHome(lat, lon, label, fly) {
+  async function setHome(lat, lon, label, fly, keepDay = false) {
     setPlaying(false);
     $("empty").style.display = "none";
     let h = 0;
@@ -1031,6 +1140,9 @@ const ION_TOKEN = "";
       const [c] = await Cesium.sampleTerrainMostDetailed(scene.terrainProvider, [Cesium.Cartographic.fromDegrees(lon, lat)]);
       h = c.height || 0;
     } catch { /* keep 0 */ }
+    const prevToday = isoDay(new Date());
+    setTz(tzForPlace(lat, lon));
+    if (state.day === prevToday && !keepDay) state.day = isoDay(new Date());
     state.home = { lat, lon, h, label };
     ctrl.minimumZoomDistance = 8;
     ctrl.maximumZoomDistance = 450;
@@ -1040,24 +1152,25 @@ const ION_TOKEN = "";
       point: { pixelSize: 12, color: Cesium.Color.fromCssColorString("#f4b740"), outlineColor: Cesium.Color.fromCssColorString("#18222f"), outlineWidth: 3, disableDepthTestDistance: Number.POSITIVE_INFINITY },
     });
     lookAtPoint(lon, lat, h, new Cesium.HeadingPitchRange(0, Cesium.Math.toRadians(-38), 110), fly);
-    updateRange(); applyTime();
+    buildDays(); updateRange(); applyTime();
     loadOsm(lat, lon);
   }
 
   // ---------- Start ----------
   const init = readHash();
+  if (init) setTz(tzForPlace(init.lat, init.lon));
   if (init) {
     if (init.day) state.day = init.day;
     if (init.min != null) state.min = init.min;
     if (init.mode) state.mode = init.mode;
     if (init.color != null) state.color = init.color;
   } else {
-    const now = new Date();
-    state.min = Math.round((now.getHours() * 60 + now.getMinutes()) / 5) * 5;
+    state.min = nowMinutes();
   }
   buildDays();
+  applyPrefs();
   applyMode();
-  if (init) setHome(init.lat, init.lon, "", false);
+  if (init) setHome(init.lat, init.lon, "", false, true);
   else applyTime();
   placeCredits();
 })();
