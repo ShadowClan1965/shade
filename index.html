@@ -104,6 +104,17 @@
   #credits img { max-height: 16px; vertical-align: middle; }
   #credits a { color: #fff; }
 
+  #handle {
+    display: block; width: 100%; height: 26px; margin: -10px 0 2px; padding: 0; border: 0; background: none; touch-action: none;
+  }
+  #handle::before {
+    content: ""; display: block; width: 44px; height: 5px; border-radius: 3px; background: var(--line); margin: 0 auto;
+  }
+  #handle:hover::before, #handle:focus-visible::before { background: var(--muted); }
+  #panel.collapsed #days, #panel.collapsed .controls, #panel.collapsed .ends, #panel.collapsed #tzLbl { display: none; }
+  #panel.collapsed #clock { font-size: 26px; }
+  #panel.collapsed #sunText { font-size: 13px; }
+  #panel.collapsed .sliderRow { margin-top: 6px; }
   .readout { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
   #clock { white-space: nowrap; font-family: var(--display); font-weight: 700; font-size: 38px; letter-spacing: -0.02em; line-height: 1; font-variant-numeric: tabular-nums; }
   #tzLbl { color: var(--muted); font-size: 12px; margin-top: 4px; }
@@ -206,7 +217,7 @@
 
 <div id="top">
   <div id="searchWrap">
-    <input id="search" type="search" enterkeyhint="search" autocomplete="street-address" placeholder="Search an address" aria-label="Search an address">
+    <input id="search" type="search" enterkeyhint="search" autocomplete="off" placeholder="Address or coordinates" aria-label="Address or coordinates">
     <ul id="results" role="listbox"></ul>
   </div>
   <button class="round" id="locate" aria-label="Use my location">
@@ -258,6 +269,7 @@
 </div>
 
 <div id="panel">
+  <button id="handle" aria-label="Hide controls" aria-expanded="true"></button>
   <div class="readout">
     <div><div id="clock">--:--</div><div id="tzLbl"></div></div>
     <div id="sunText">Search an address to start</div>
@@ -558,6 +570,29 @@ const ION_TOKEN = "";
   }
   new ResizeObserver(placeCredits).observe($("panel"));
   window.addEventListener("resize", placeCredits);
+
+  // ---------- Collapsible panel ----------
+  function setCollapsed(on) {
+    $("panel").classList.toggle("collapsed", on);
+    $("handle").setAttribute("aria-expanded", String(!on));
+    $("handle").setAttribute("aria-label", on ? "Show controls" : "Hide controls");
+    store.set("shade.collapsed", on);
+    placeCredits();
+  }
+  let dragY = null;
+  $("handle").addEventListener("pointerdown", (e) => { dragY = e.clientY; });
+  $("handle").addEventListener("pointerup", (e) => {
+    if (dragY === null) return;
+    const dy = e.clientY - dragY;
+    dragY = null;
+    if (dy > 20) setCollapsed(true);
+    else if (dy < -20) setCollapsed(false);
+    else setCollapsed(!$("panel").classList.contains("collapsed"));
+  });
+  $("handle").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setCollapsed(!$("panel").classList.contains("collapsed")); }
+  });
+  setCollapsed(store.get("shade.collapsed", false));
 
   // ---------- Colors ----------
   const COL = {
@@ -1087,33 +1122,111 @@ const ION_TOKEN = "";
     else c = Cesium.Cartographic.fromCartesian(dest);
     return { lon: Cesium.Math.toDegrees(c.longitude), lat: Cesium.Math.toDegrees(c.latitude) };
   }
+  // ---------- Coordinates and map links ----------
+  function parseCoords(q) {
+    const ok = (lat, lon) => isFinite(lat) && isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180 ? { lat, lon } : null;
+    // Google Maps links: the dropped-pin location (!3d…!4d…) beats the view center (@lat,lon).
+    let m = q.match(/!3d(-?\d+(?:\.\d+)?)!4d(-?\d+(?:\.\d+)?)/);
+    if (m) return ok(+m[1], +m[2]);
+    m = q.match(/[?&](?:q|query|ll|destination)=(-?\d+(?:\.\d+)?)(?:,|%2C)\s*(-?\d+(?:\.\d+)?)/i);
+    if (m) return ok(+m[1], +m[2]);
+    m = q.match(/@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)/);
+    if (m) return ok(+m[1], +m[2]);
+    // Plain decimals: "43.7935, -79.5312" or "43.7935 -79.5312"
+    m = q.match(/^\s*(-?\d{1,2}(?:\.\d+)?)\s*[,;\s]\s*(-?\d{1,3}(?:\.\d+)?)\s*$/);
+    if (m) return ok(+m[1], +m[2]);
+    // Degrees with N/S/E/W, optionally minutes and seconds: 43°47'36.6"N 79°31'52.3"W
+    const re = /(\d+(?:\.\d+)?)\s*°?\s*(?:(\d+(?:\.\d+)?)\s*['′’]\s*)?(?:(\d+(?:\.\d+)?)\s*(?:["″”]|'')\s*)?([NSEW])/gi;
+    const parts = [...q.matchAll(re)];
+    if (parts.length === 2) {
+      let lat, lon;
+      for (const p of parts) {
+        let v = +p[1] + (+p[2] || 0) / 60 + (+p[3] || 0) / 3600;
+        const h = p[4].toUpperCase();
+        if (h === "S" || h === "W") v = -v;
+        if (h === "N" || h === "S") lat = v; else lon = v;
+      }
+      return ok(lat, lon);
+    }
+    return null;
+  }
+
+  // ---------- Address search ----------
+  function withTimeout(promise, ms) {
+    return Promise.race([promise, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms))]);
+  }
+  async function ionSearch(q, mode) {
+    const res = await withTimeout(geocoderFor(mode).geocode(q), 8000);
+    return (res || []).map((r) => ({ name: r.displayName, ...destToLonLat(r.destination) }));
+  }
+  // Photon: fast OpenStreetMap address search, matches the OSM buildings in Blocks view.
+  async function photonSearch(q) {
+    const near = state.home ? `&lat=${state.home.lat}&lon=${state.home.lon}` : "";
+    const r = await withTimeout(fetch(`https://photon.komoot.io/api/?q=${encodeURIComponent(q)}&limit=5${near}`), 8000);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const j = await r.json();
+    return (j.features || []).map((f) => {
+      const p = f.properties || {};
+      const street = [p.housenumber, p.street].filter(Boolean).join(" ");
+      const name = [p.name !== p.street ? p.name : null, street, p.city || p.town || p.village, p.state, p.country]
+        .filter(Boolean).filter((v, i, a) => a.indexOf(v) === i).join(", ");
+      return { name, lon: f.geometry.coordinates[0], lat: f.geometry.coordinates[1] };
+    });
+  }
+  let searchId = 0;
   async function runSearch() {
     const q = $("search").value.trim();
     if (!q) return;
     $("search").blur();
-    let res = [];
-    try { res = await geocoderFor(state.mode).geocode(q); }
-    catch {
-      try { res = await new Cesium.IonGeocoderService({ scene }).geocode(q); }
-      catch { toast("Address search failed. Check your connection and token."); return; }
-    }
-    if (!res || !res.length) { toast("No match. Try adding the city or ZIP code."); return; }
-    if (res.length === 1) { pick(res[0]); return; }
     const ul = $("results");
+    ul.classList.remove("open");
+
+    const c = parseCoords(q);
+    if (c) {
+      const label = `${c.lat.toFixed(6)}, ${c.lon.toFixed(6)}`;
+      $("search").value = label;
+      setHome(c.lat, c.lon, label, true);
+      return;
+    }
+    if (/maps\.app\.goo\.gl|goo\.gl\/maps/i.test(q)) {
+      toast("Short share links can't be read. In Google Maps, long-press the spot and copy the coordinates instead.", 7000);
+      return;
+    }
+
+    const myId = ++searchId;
+    toast("Searching…", 10000);
+    // Google results only go with the Google mesh; Bing and OpenStreetMap go with Blocks.
+    const jobs = state.mode === "mesh" ? [ionSearch(q, "mesh")] : [photonSearch(q), ionSearch(q, "blocks")];
+    const settled = await Promise.allSettled(jobs);
+    if (myId !== searchId) return;
+    const all = [];
+    for (const s of settled) if (s.status === "fulfilled") all.push(...s.value);
+    const res = [];
+    for (const r of all) {
+      if (!r.name || !isFinite(r.lat)) continue;
+      if (res.some((x) => distM(x.lat, x.lon, r.lat, r.lon) < 25)) continue;
+      res.push(r);
+    }
+    $("toast").classList.remove("show");
+    if (!res.length) {
+      const failed = settled.every((s) => s.status === "rejected");
+      toast(failed ? "Address search failed. Check your connection." : "No match. Try adding the city, or paste coordinates from Google Maps.", 6000);
+      return;
+    }
+    if (res.length === 1) { pick(res[0]); return; }
     ul.innerHTML = "";
-    for (const r of res.slice(0, 5)) {
+    for (const r of res.slice(0, 6)) {
       const li = document.createElement("li");
       const b = document.createElement("button");
-      b.textContent = r.displayName;
+      b.textContent = r.name;
       b.onclick = () => pick(r);
       li.appendChild(b); ul.appendChild(li);
     }
     ul.classList.add("open");
     function pick(r) {
       ul.classList.remove("open");
-      const { lon, lat } = destToLonLat(r.destination);
-      $("search").value = r.displayName;
-      setHome(lat, lon, r.displayName, true);
+      $("search").value = r.name;
+      setHome(r.lat, r.lon, r.name, true);
     }
   }
   $("search").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); runSearch(); } });
